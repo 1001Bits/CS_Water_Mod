@@ -617,12 +617,51 @@ namespace
 		spdlog::set_pattern("[%H:%M:%S.%e] %v");
 	}
 
+	// The engine's own pass over the water objects: Main::RenderWaterEffects calls TESWaterSystem::UpdateForCamera on the
+	// main thread for every frame it draws (the call loads the water system into RCX and the camera into RDX; checked on
+	// 1.5.97, 1.6.1170 and 1.7.104). The work runs right after it, on that thread, at the moment the engine itself walks
+	// and updates the same water objects, about ten times a second as before. A queued SKSE task gave no such guarantee:
+	// on 1.7 it can run on a worker thread while the game's jobs add and remove water geometry.
+	struct WaterUpdateHook
+	{
+		static void thunk(RE::TESWaterSystem* a_system, void* a_camera)
+		{
+			func(a_system, a_camera);
+			static auto last = std::chrono::steady_clock::now();
+			const auto  now = std::chrono::steady_clock::now();
+			if (now - last >= 100ms) {
+				last = now;
+				Update();
+			}
+		}
+		static inline REL::Relocation<decltype(thunk)> func;
+	};
+
+	bool InstallWaterUpdateHook()
+	{
+		const auto addr = REL::RelocationID(35561, 36560).address() + REL::Relocate(0xE2, 0xE9);
+		if (*reinterpret_cast<const std::uint8_t*>(addr) != 0xE8) {
+			logger::error("water update call site at {:#x} is not a call instruction; updating from a queued task instead", addr);
+			return false;
+		}
+		// TESWaterSystem::UpdateForCamera; another target means another mod hooks this call too (the hook chains after it)
+		const auto target = addr + 5 + *reinterpret_cast<const std::int32_t*>(addr + 1);
+		if (target != REL::RelocationID(31383, 32174).address())
+			logger::info("water update call at {:#x} already leads to {:#x} (another mod's hook); chaining after it", addr, target);
+		SKSE::AllocTrampoline(14);
+		WaterUpdateHook::func = SKSE::GetTrampoline().write_call<5>(addr, WaterUpdateHook::thunk);
+		logger::info("water update hook installed at {:#x}: updates run with the engine's own water pass", addr);
+		return true;
+	}
+
 	void OnMessage(SKSE::MessagingInterface::Message* a_msg)
 	{
 		if (a_msg->type == SKSE::MessagingInterface::kDataLoaded) {
 			logger::info("WaterWind 1.0.0 on game {}", REL::Module::get().version().string());
 			WaterWindMenu::Register();
 			CaptureBases();
+			if (InstallWaterUpdateHook())
+				return;
 			std::thread([]() {
 				for (;;) {
 					std::this_thread::sleep_for(100ms);
